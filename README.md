@@ -7,7 +7,8 @@ The end goal is a per-frame **HUD mask**: a pixel mask of everything that is dra
 ## Status
 
 > **OCR now runs on the GPU at about 172 ms per 1080p frame end to end with the accurate models, down from about 15 seconds on CPU (roughly 90× faster), with identical results. The small mobile models bring it to about 121 ms, but find fewer text regions.**
-> Next: measure what the mobile models miss, try lower detection resolution, make preview saving asynchronous, then add the HUD vs in-world classification.
+> **A first rule-based classifier now labels each detected text as HUD, in-world or unknown, and writes a per-frame HUD mask.**
+> Next: a static-pixel mask for non-text HUD (compass, minimap, crosshair), measure what the mobile models miss, try lower detection resolution.
 
 What works today:
 
@@ -15,6 +16,7 @@ What works today:
 - Running OCR (text detection + recognition) on every frame with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), on CPU or GPU
 - Saving per-frame results: boxed preview images, raw JSON, and one CSV with every detected text region
 - A timing breakdown per stage (model loading, inference, saving)
+- Classifying each detection as HUD, in-world or unknown from how it moves across frames, with a black/white HUD mask per frame
 
 ## Performance
 
@@ -83,13 +85,19 @@ game-text-recognition/
 ├── data/
 │   ├── gameplay.mp4         ← your recording (not in git)
 │   └── frames/              ← extracted frames (not in git)
-├── outputs/ocr/             ← results (not in git)
-│   ├── images/              ← frames with detected text boxed
-│   ├── json/                ← raw OCR output per frame
-│   └── summary.csv          ← one row per detected text region
+├── outputs/                 ← results (not in git)
+│   ├── ocr/
+│   │   ├── images/          ← frames with detected text boxed
+│   │   ├── json/            ← raw OCR output per frame
+│   │   └── summary.csv      ← one row per detected text region
+│   └── hud/
+│       ├── images/          ← frames with boxes coloured by label
+│       ├── masks/           ← black/white HUD mask per frame
+│       └── classified.csv   ← every detection with label and reason
 ├── scripts/
 │   ├── extract_frames.py    ← video → PNG frames (OpenCV)
 │   ├── run_ocr.py           ← OCR over all frames + timing report
+│   ├── classify_hud.py      ← HUD vs in-world classification + HUD masks
 │   └── make_examples.py     ← copy sample results into examples/
 ├── requirements.txt         ← CPU install
 └── requirements-gpu.txt     ← GPU install (NVIDIA, CUDA 12.6 build)
@@ -143,9 +151,56 @@ From the project root, with the `hudmask` environment active:
    - `--no-images --no-json`: only write the CSV (recommended for speed; ~2.3× faster per frame on GPU)
    - `--mkldnn`: re-enable oneDNN on CPU, on PaddlePaddle versions without the crash
 
+3. Classify the detections as HUD, in-world or unknown, and write the HUD masks:
+   ```
+   python scripts/classify_hud.py
+   ```
+   It reads `outputs/ocr/summary.csv` by default; use `--csv path/to/other.csv` to classify a different run.
+
+## HUD vs in-world classification
+
+OCR only says "there is text here". Whether that text is HUD or part of the world shows in **how it moves across frames**:
+
+- **HUD text is glued to the screen.** It stays at the same pixel position while the camera moves.
+- **In-world text is glued to the world.** When the camera moves, the same text appears at a different screen position.
+
+`classify_hud.py` turns this into rules:
+
+1. Ignore detections below 0.8 confidence (mostly textures misread as text).
+2. Link boxes in consecutive frames that overlap by at least 50% (IoU ≥ 0.5) into **tracks**. Matching is on position only, because HUD text can change in place (an ammo counter going 30 → 29).
+3. **HUD:** a track that stays in place for 2 or more frames *while the camera moves*. Camera motion is the mean pixel difference between consecutive frames, downscaled 8× and in greyscale. Without this check, a sign would also look static whenever the player stands still.
+4. **In-world:** the same text (fuzzy match, tolerating OCR typos like "SECURITY" / "DECURITY") appears in a nearby frame at a clearly different position.
+5. **Unknown:** seen only once, or only while the camera was still. The classifier does not guess.
+
+One special case: when a new subtitle line appears, the old line moves straight up with the same left/right edges and size. Text in the 3D world almost never moves like that, so this pattern is marked unknown instead of in-world.
+
+### Results
+
+Input: the mobile-model OCR run (v4), 50 frames sampled at 1 fps, 97 detections above 0.8 confidence.
+
+| Label | Count |
+|---|---|
+| HUD | 35 |
+| In-world | 26 |
+| Unknown | 36 |
+
+Camera motion between consecutive frames: min 7.6, median 30.7, max 74.0 (threshold 8.0), so 47 of 49 frame pairs counted as "camera moved".
+
+On the medium-model OCR output (144 detections above 0.8), a manual review of every label found no HUD/in-world mix-ups: the objective line, "Objectives Updated.", subtitles and an ammo-style counter (same position in 14 frames) were labelled HUD; signs such as "PUBLIC NOTICE", "MANHATTAN" and "SECURITY NOTICE" were labelled in-world.
+
+![Detections coloured by label: green = HUD, red = in-world, grey = unknown](examples/hud_example.jpg)
+
+![HUD mask for the same frame: white = HUD text](examples/hud_mask_example.png)
+
+### Known limitations
+
+- **Compass letters are mostly "unknown".** They are HUD, but they slide along the compass bar as the player turns, so they never stay in place. A static-pixel mask (pixels that do not change while the camera moves) is the planned fix, and it also covers non-text HUD such as the minimap and crosshair.
+- **Text seen only once cannot be decided.** Sampling at 1 fps makes this common; extracting at a higher rate (`extract_frames.py --fps 5`) gives each text more chances to show how it moves.
+- **Thresholds are hand-tuned** on one game. Ground truth from Unreal Engine 5 captures (frames rendered with and without UI) is planned to measure accuracy properly.
+
 ## Example output
 
-Detected text boxed on sample frames. HUD text (objective, subtitles, compass, counter) and in-world text (signs, notices) are both found; telling them apart is the next step.
+Raw OCR output on sample frames, before classification. HUD text (objective, subtitles, compass, counter) and in-world text (signs, notices) are both found.
 
 ![HUD objective, subtitles and in-world signs](examples/example_1.jpg)
 
@@ -170,8 +225,9 @@ From a first run over 50 frames of a first-person shooter:
 - [x] Speed comparison, model size: mobile models 172 → 121 ms per frame, 171 → 110 regions
 - [ ] Measure which text regions the mobile models miss (real text vs noise)
 - [ ] Speed comparison, detection resolution (`--det-size`)
-- [ ] Track text boxes across frames
-- [ ] Classify HUD vs in-world text (screen-space position stability, optical flow vs camera motion, geometry)
+- [x] Track text boxes across frames (position-based, IoU)
+- [x] Classify HUD vs in-world text, first version: position stability + camera motion + same-text-moved rule
+- [ ] Better camera motion signal: optical flow inside each box vs global flow
 - [ ] Static-pixel mask for non-text HUD (minimap, crosshair, icons)
 - [ ] Combined per-frame HUD mask with temporal smoothing
 - [ ] Ground-truth evaluation with Unreal Engine 5 captures (frames rendered with and without UI)
