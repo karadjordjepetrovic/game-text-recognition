@@ -1,0 +1,10 @@
+# Large or generated files: keep them out of git
+data/
+outputs/
+*.mp4
+*.mkv
+
+# Python junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
